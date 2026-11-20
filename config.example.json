@@ -1,0 +1,39 @@
+{
+  "data_dir": "./data",
+  "default_owner_id": "operator",
+  "default_timezone": "UTC",
+  "speculative_provider_id": "spec-openai",
+  "api_token": "${SPEC_API_TOKEN}",
+  "worker_token": "${SPEC_WORKER_TOKEN}",
+  "cooldown": {
+    "enable": true,
+    "failures": 2,
+    "cooldown_seconds": 180,
+    "max_cooldown_seconds": 1800
+  },
+  "github_app": {
+    "app_id": "${SPEC_GITHUB_APP_ID}",
+    "installation_id": "${SPEC_GITHUB_APP_INSTALLATION_ID}",
+    "private_key_path": "${SPEC_GITHUB_APP_PRIVATE_KEY_PATH}"
+  },
+  "providers": [
+    {
+      "provider_id": "spec-openai",
+      "model": "gpt-4.1-mini",
+      "api_base": "https://api.openai.com/v1",
+      "keys": ["${SPEC_OPENAI_API_KEY}"],
+      "api_type": "openai_chat_completion",
+      "pool": "speculative",
+      "prefer_stream": true
+    },
+    {
+      "provider_id": "spec-gemini",
+      "model": "gemini-2.5-flash",
+      "api_base": "https://generativelanguage.googleapis.com/v1beta",
+      "keys": ["${SPEC_GEMINI_API_KEY}"],
+      "api_type": "gemini_generate_content",
+      "pool": "speculative",
+      "prefer_stream": false
+    }
+  ]
+}

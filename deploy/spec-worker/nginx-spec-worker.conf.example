@@ -1,0 +1,14 @@
+# Example Nginx location block on the control-plane host.
+# Restrict the reverse-WSS worker endpoint by source IP and pass directly to the control plane.
+# Never expose provider credentials to the worker node.
+
+location = /api/spec-worker/ws {
+    allow 203.0.113.10; # Replace with your sandbox worker's egress IP
+    deny all;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $http_host;
+    proxy_read_timeout 3600s;
+    proxy_pass http://127.0.0.1:8765;
+}

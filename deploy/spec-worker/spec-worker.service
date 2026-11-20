@@ -1,0 +1,36 @@
+[Unit]
+Description=Speculative Coding isolated sandbox execution worker
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/opt/spec_sandbox
+
+[Service]
+Type=simple
+User=spec-worker
+Group=spec-worker
+WorkingDirectory=/opt/spec-worker
+EnvironmentFile=/etc/spec-worker.env
+ExecStart=/opt/spec-worker/.venv/bin/python -m speculative_coding.worker
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+MemoryHigh=2800M
+MemoryMax=3200M
+MemorySwapMax=1800M
+TasksMax=512
+CPUQuota=180%
+Nice=10
+OOMScoreAdjust=800
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/spec_sandbox
+# bubblewrap needs unprivileged user namespaces; do not set RestrictNamespaces=yes.
+# bubblewrap configures loopback inside its unshared network namespace via netlink.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
