@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speculative-coding"
+version = "0.1.0"
+description = "Autonomous dual-node speculative coding control plane, sandbox worker, and delegation agent."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "aiohttp>=3.10.5",
+    "httpx>=0.27.2",
+    "jsonschema>=4.0.0",
+    "openai>=1.52.0",
+    "pycryptodome>=3.20.0",
+]
+
+[project.optional-dependencies]
+vision = ["Pillow>=10.4.0"]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+spec-coding = "speculative_coding.cli:main"
+spec-server = "speculative_coding.server:main"
+spec-worker = "speculative_coding.worker:main"
+
+[tool.setuptools.packages.find]
+include = ["speculative_coding*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --disable-warnings --tb=short"
