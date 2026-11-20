@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from speculative_coding.config import ProviderEndpoint, SpecConfig
+from speculative_coding.config import ProviderEndpoint, RoleBudget, SpecConfig
 from speculative_coding.llm.router import ProviderRouter
 
 
@@ -123,6 +123,58 @@ class ProviderPoolIsolationTests(unittest.TestCase):
         self.assertEqual(cfg.worker_token, "t" * 32)
         self.assertEqual(cfg.providers["spec-1"].keys, ["interpolated-key"])
         self.assertEqual(cfg.providers["spec-1"].context_window, 131_072)
+
+    def test_dedicated_outbox_db_path_default_and_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = SpecConfig(data_dir=root)
+            self.assertEqual(cfg.db_path, root / "speculative.db")
+            self.assertEqual(cfg.outbox_db_path, root / "worker_outbox.db")
+            self.assertNotEqual(cfg.db_path, cfg.outbox_db_path)
+
+            custom_outbox = root / "custom_outbox.db"
+            cfg_dict = self._config_from_raw({"data_dir": str(root), "outbox_db_path": str(custom_outbox)})
+            self.assertEqual(cfg_dict.outbox_db_path, custom_outbox)
+
+            with patch.dict("os.environ", {"SPEC_OUTBOX_DB_PATH": str(custom_outbox)}, clear=False):
+                cfg_env = SpecConfig.from_env(data_dir=root)
+            self.assertEqual(cfg_env.outbox_db_path, custom_outbox)
+
+    def test_per_role_budgets_defaults_config_and_env_overrides(self):
+        cfg = SpecConfig()
+        self.assertEqual(cfg.get_role_budget("recon"), RoleBudget(max_steps=20, deadline_seconds=600.0, max_total_tokens=None))
+        self.assertEqual(cfg.get_role_budget("coder"), RoleBudget(max_steps=40, deadline_seconds=1200.0, max_total_tokens=None))
+        self.assertEqual(cfg.get_role_budget("reviewer"), RoleBudget(max_steps=15, deadline_seconds=450.0, max_total_tokens=None))
+        self.assertEqual(cfg.get_role_budget("inspector"), RoleBudget(max_steps=15, deadline_seconds=450.0, max_total_tokens=None))
+        self.assertEqual(cfg.get_role_budget("report"), RoleBudget(max_steps=8, deadline_seconds=240.0, max_total_tokens=None))
+
+        cfg_file = self._config_from_raw(
+            {
+                "role_budgets": {
+                    "coder": {"max_steps": 55, "deadline_seconds": 1500, "max_total_tokens": 250000},
+                    "report": {"max_steps": 5},
+                }
+            }
+        )
+        self.assertEqual(cfg_file.get_role_budget("coder").max_steps, 55)
+        self.assertEqual(cfg_file.get_role_budget("coder").deadline_seconds, 1500.0)
+        self.assertEqual(cfg_file.get_role_budget("coder").max_total_tokens, 250000)
+        self.assertEqual(cfg_file.get_role_budget("report").max_steps, 5)
+        self.assertEqual(cfg_file.get_role_budget("report").deadline_seconds, 240.0)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SPEC_BUDGET_RECON_MAX_STEPS": "12",
+                "SPEC_BUDGET_RECON_DEADLINE_SECONDS": "300",
+                "SPEC_BUDGET_RECON_MAX_TOTAL_TOKENS": "80000",
+            },
+            clear=False,
+        ):
+            cfg_env = SpecConfig.from_env()
+        self.assertEqual(cfg_env.get_role_budget("recon").max_steps, 12)
+        self.assertEqual(cfg_env.get_role_budget("recon").deadline_seconds, 300.0)
+        self.assertEqual(cfg_env.get_role_budget("recon").max_total_tokens, 80000)
 
 
 if __name__ == "__main__":

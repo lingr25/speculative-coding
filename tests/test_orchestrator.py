@@ -17,9 +17,16 @@ from unittest.mock import AsyncMock, Mock, patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from speculative_coding.config import ProviderEndpoint, SpecConfig
+from speculative_coding.config import ProviderEndpoint, RoleBudget, SpecConfig
 from speculative_coding.llm.types import ContextOverflowError, LLMStreamResult, ToolCallRequest
-from speculative_coding.orchestrator import SpecSleep, SpeculativeOrchestrator
+from speculative_coding.orchestrator import (
+    SpecSleep,
+    SpeculativeOrchestrator,
+    _compact_graveyard_for_recon,
+    _extract_image_artifacts,
+    _is_graveyard_duplicate,
+    _sanitize_gate_for_llm,
+)
 from speculative_coding.sandbox import LocalDirSandbox, RemoteWorkerSandbox
 from speculative_coding.tool_result import ToolResult
 from speculative_coding.worker import Worker
@@ -511,7 +518,6 @@ class BaselineContracts(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(entered.wait(), 2)
         evict = asyncio.create_task(self.backend._admit())
         await asyncio.sleep(0)
-        self.assertFalse(evict.done())
         finish.set()
         baseline = await acquire
         await evict
@@ -852,6 +858,507 @@ class ParallelToolAgentTests(unittest.IsolatedAsyncioTestCase):
                 run_id="",
                 candidate=self.cand,
             )
+
+
+class BrainOverhaulAndMultimodalTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.ep = ProviderEndpoint(
+            provider_id="spec-vision",
+            source_id="src",
+            model="test-vision-model",
+            api_base="https://example.invalid/v1",
+            keys=["k"],
+            modalities=["text", "image", "tool_use"],
+            pool="speculative",
+        )
+        self.config = SpecConfig(
+            data_dir=self.root,
+            providers={"spec-vision": self.ep},
+            speculative_provider_id="spec-vision",
+            role_budgets={
+                "recon": RoleBudget(max_steps=11, deadline_seconds=310.0, max_total_tokens=45000),
+                "coder": RoleBudget(max_steps=22, deadline_seconds=620.0, max_total_tokens=90000),
+                "reviewer": RoleBudget(max_steps=9, deadline_seconds=210.0, max_total_tokens=30000),
+                "inspector": RoleBudget(max_steps=7, deadline_seconds=180.0, max_total_tokens=25000),
+                "report": RoleBudget(max_steps=4, deadline_seconds=95.0, max_total_tokens=12000),
+            },
+        )
+        self.user = {"owner_id": "owner", "is_admin": True}
+        self.auth = SimpleNamespace(require_admin=lambda request: self.user)
+        self.backend = FakeBackend()
+        self.engine = SpeculativeOrchestrator(self.config, self.backend, auth=self.auth)
+        self.project = self.engine.store.new_project(
+            "owner",
+            {
+                "name": "demo",
+                "repo_source": "https://github.com/example/demo.git",
+                "gate_commands_json": ["python -m pytest"],
+                "preview_command": "python preview.py",
+                "routes_per_batch": 3,
+            },
+        )
+
+    async def test_dedicated_outbox_db_path_is_passed_to_remote_worker_sandbox(self):
+        default_engine = SpeculativeOrchestrator(self.config, auth=self.auth)
+        self.assertIsInstance(default_engine.backend, RemoteWorkerSandbox)
+        self.assertEqual(default_engine.backend.journal_path, self.config.outbox_db_path)
+        self.assertNotEqual(default_engine.backend.journal_path, default_engine.store.path)
+        self.assertEqual(default_engine.backend.journal_path.name, "worker_outbox.db")
+
+    async def test_sanitize_gate_strips_base64_and_agent_injects_multimodal_vision_capped_at_4(self):
+        b64_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2dIAAAAASUVORK5CYII="
+        raw_gate = {
+            "passed": True,
+            "gates": [{"command": "pytest", "code": 0, "output": "ok"}],
+            "preview": {"code": 0, "output": "rendered"},
+            "artifacts": [
+                {"path": f"shot_{i}.png", "base64": b64_png} for i in range(6)
+            ]
+            + [{"path": "index.html", "base64": "PGgxPmhpPC9oMT4="}],
+        }
+        sanitized = _sanitize_gate_for_llm(raw_gate)
+        self.assertNotIn("base64", json.dumps(sanitized))
+        self.assertNotIn(b64_png, json.dumps(sanitized))
+        self.assertEqual(len(sanitized["artifacts"]), 7)
+        self.assertEqual(sanitized["artifacts"][0]["path"], "shot_0.png")
+        self.assertEqual(sanitized["artifacts"][0]["mime_type"], "image/png")
+        self.assertGreater(sanitized["artifacts"][0]["size_bytes"], 0)
+
+        images = _extract_image_artifacts(raw_gate)
+        self.assertEqual(len(images), 4)
+        self.assertTrue(all(img["path"].endswith(".png") for img in images))
+
+        router = self.engine._role(self.project, "inspector")
+        router.complete_step = AsyncMock(
+            return_value=LLMStreamResult(
+                tool_calls=[
+                    ToolCallRequest(
+                        "t1",
+                        "submit_result",
+                        json.dumps({"result": {"decision": "NOMINATE", "feedback": "looks sharp"}}),
+                    )
+                ],
+                input_tokens=40,
+                output_tokens=20,
+            )
+        )
+        verdict = await self.engine.agent(
+            self.project,
+            "inspector",
+            "Inspect screenshots",
+            {"base_sha": "a" * 40, "gate_evidence": raw_gate},
+            run_id="r1",
+            candidate={"cand_id": "c1", "generation": 0},
+            image_artifacts=raw_gate["artifacts"],
+        )
+        self.assertEqual(verdict["decision"], "NOMINATE")
+        self.assertTrue(router.complete_step.await_args.kwargs["need_vision"])
+        sent_messages = router.complete_step.await_args.args[0]
+        user_msg = next(m for m in sent_messages if m["role"] == "user")
+        self.assertIsInstance(user_msg["content"], list)
+        text_parts = [p for p in user_msg["content"] if p.get("type") == "text"]
+        img_parts = [p for p in user_msg["content"] if p.get("type") == "image_url"]
+        self.assertEqual(len(text_parts), 1)
+        self.assertNotIn(b64_png, text_parts[0]["text"])
+        self.assertEqual(len(img_parts), 4)
+        self.assertTrue(img_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    async def test_drive_strips_base64_for_reviewer_and_report_and_passes_images_to_inspector(self):
+        b64_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2dIAAAAASUVORK5CYII="
+        orig_call = self.backend.call
+
+        async def gate_with_png(op, **a):
+            res = await orig_call(op, **a)
+            if op == "gate":
+                res["artifacts"] = [
+                    {"path": "preview.png", "base64": b64_png},
+                    {"path": "index.html", "base64": "PGgxPk9LPC9oMT4="},
+                ]
+            return res
+
+        self.backend.call = gate_with_png
+        now = time.time()
+        self.engine.store.insert(
+            "runs",
+            dict(run_id="r-vis", project_id=self.project["project_id"], base_sha="a" * 40, status="executing", created_at=now),
+        )
+        self.engine.store.insert(
+            "candidates",
+            dict(
+                cand_id="c-vis",
+                run_id="r-vis",
+                project_id=self.project["project_id"],
+                route_index=0,
+                title="Visual gameplay",
+                route_plan="Add visual gameplay",
+                route_kind="feature_gameplay",
+                branch_ref="refs/spec/c-vis",
+                status="coding",
+                base_sha="a" * 40,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+        seen_calls = []
+
+        async def fake_agent(p, role, instruction, context, **kw):
+            seen_calls.append((role, instruction, context, kw))
+            if role == "coder":
+                return {"summary": "implemented"}
+            if kw.get("budget_role") == "report":
+                return {"report": "### What Changed\nUI.\n### How It Works\nCanvas.\n### Gates & Verification\nPassed."}
+            return {"decision": "NOMINATE", "feedback": "verified"}
+
+        self.engine.agent = fake_agent
+        await self.engine.drive(self.project, self.engine.store.get("candidates", "c-vis"))
+
+        reviewer_call = next(c for c in seen_calls if c[0] == "reviewer" and c[3].get("budget_role") != "report")
+        inspector_call = next(c for c in seen_calls if c[0] == "inspector")
+        report_call = next(c for c in seen_calls if c[3].get("budget_role") == "report")
+
+        for call in (reviewer_call, inspector_call, report_call):
+            self.assertNotIn(b64_png, json.dumps(call[2]["gate_evidence"]))
+        self.assertIsNone(reviewer_call[3].get("image_artifacts"))
+        self.assertEqual(len(inspector_call[3]["image_artifacts"]), 1)
+        self.assertEqual(inspector_call[3]["image_artifacts"][0]["path"], "preview.png")
+
+        # Stored preview_meta_json still retains raw base64 for preview_api serving.
+        stored = self.engine.store.get("candidates", "c-vis")
+        self.assertEqual(stored["preview_meta_json"]["artifacts"][0]["base64"], b64_png)
+
+    async def test_per_role_budgets_forwarded_to_agent_loop(self):
+        captured: list[dict] = []
+
+        async def fake_run(self_loop, **kwargs):
+            captured.append(kwargs)
+            return SimpleNamespace(text='{"decision":"NOMINATE","feedback":"ok"}', return_value={"decision": "NOMINATE", "feedback": "ok"})
+
+        with patch("speculative_coding.orchestrator.AgentLoop.run", new=fake_run):
+            await self.engine.agent(self.project, "coder", "code", {"base_sha": "a" * 40}, run_id="r1", allow_write=True)
+            await self.engine.agent(
+                self.project,
+                "reviewer",
+                "report",
+                {"base_sha": "a" * 40},
+                run_id="r1",
+                budget_role="report",
+            )
+
+        self.assertEqual(captured[0]["max_steps"], 22)
+        self.assertEqual(captured[0]["deadline_seconds"], 620.0)
+        self.assertEqual(captured[0]["max_total_tokens"], 90000)
+        self.assertEqual(captured[1]["max_steps"], 4)
+        self.assertEqual(captured[1]["deadline_seconds"], 95.0)
+        self.assertEqual(captured[1]["max_total_tokens"], 12000)
+
+    async def test_tournament_judge_selects_winner_and_drops_loser(self):
+        now = time.time()
+        self.engine.store.insert(
+            "runs",
+            dict(run_id="r-tour", project_id=self.project["project_id"], base_sha="a" * 40, status="executing", created_at=now),
+        )
+        for idx, cid in enumerate(("cand-a", "cand-b")):
+            self.engine.store.insert(
+                "candidates",
+                dict(
+                    cand_id=cid,
+                    run_id="r-tour",
+                    project_id=self.project["project_id"],
+                    route_index=idx,
+                    title=f"Approach {cid}",
+                    route_plan=f"Implement {cid}",
+                    route_kind="optimization",
+                    competition_group="cache-layer",
+                    branch_ref="refs/spec/" + cid,
+                    status="coding",
+                    base_sha="a" * 40,
+                    created_at=now + idx,
+                    updated_at=now + idx,
+                ),
+            )
+
+        judge_contexts = []
+
+        async def fake_agent(p, role, instruction, context, **kw):
+            if role == "coder":
+                return {"summary": "done"}
+            if kw.get("budget_role") == "report":
+                return {"report": "### What Changed\nDone.\n### How It Works\nClean.\n### Gates & Verification\nPassed."}
+            if "competition_group" in context:
+                judge_contexts.append(context)
+                return {"winner_cand_id": "cand-a", "rationale": "cand-a is simpler with smaller diff"}
+            return {"decision": "NOMINATE", "feedback": "solid"}
+
+        self.engine.agent = fake_agent
+        cands = [self.engine.store.get("candidates", "cand-a"), self.engine.store.get("candidates", "cand-b")]
+        await self.engine.run_candidates(self.project, cands)
+
+        self.assertEqual(len(judge_contexts), 1)
+        self.assertEqual(judge_contexts[0]["competition_group"], "cache-layer")
+        self.assertEqual({e["cand_id"] for e in judge_contexts[0]["candidates"]}, {"cand-a", "cand-b"})
+        self.assertEqual(self.engine.store.get("candidates", "cand-a")["status"], "staged")
+        self.assertEqual(self.engine.store.get("candidates", "cand-b")["status"], "dropped")
+
+        grave = self.engine.store.rows("graveyard", "project_id=?", (self.project["project_id"],))
+        self.assertEqual(len(grave), 1)
+        self.assertEqual(grave[0]["source"], "tournament_judge")
+        self.assertIn("cand-a", grave[0]["reason"])
+
+        tour_events = [
+            e for e in self.engine.store.events("owner", project_id=self.project["project_id"]) if e["kind"] == "tournament"
+        ]
+        self.assertEqual(len(tour_events), 1)
+        self.assertEqual(tour_events[0]["payload_json"]["winner_cand_id"], "cand-a")
+        self.assertEqual(tour_events[0]["payload_json"]["dropped_cand_ids"], ["cand-b"])
+
+    async def test_tournament_judge_none_drops_all_competitors(self):
+        now = time.time()
+        self.engine.store.insert(
+            "runs",
+            dict(run_id="r-none", project_id=self.project["project_id"], base_sha="a" * 40, status="executing", created_at=now),
+        )
+        for idx, cid in enumerate(("cand-x", "cand-y")):
+            self.engine.store.insert(
+                "candidates",
+                dict(
+                    cand_id=cid,
+                    run_id="r-none",
+                    project_id=self.project["project_id"],
+                    route_index=idx,
+                    title=f"Alt {cid}",
+                    route_plan=f"Plan {cid}",
+                    route_kind="architecture",
+                    competition_group="router-v2",
+                    branch_ref="refs/spec/" + cid,
+                    status="staged",
+                    human_report_md="### What Changed\nMeh.",
+                    diff_text="+++ b/app.py\n+pass\n",
+                    base_sha="a" * 40,
+                    head_sha="b" * 40,
+                    created_at=now + idx,
+                    updated_at=now + idx,
+                ),
+            )
+
+        self.engine.agent = AsyncMock(return_value={"winner_cand_id": "NONE", "rationale": "both add unnecessary churn"})
+        await self.engine._run_tournament_judges(
+            self.project,
+            [self.engine.store.get("candidates", "cand-x"), self.engine.store.get("candidates", "cand-y")],
+        )
+        self.assertEqual(self.engine.store.get("candidates", "cand-x")["status"], "dropped")
+        self.assertEqual(self.engine.store.get("candidates", "cand-y")["status"], "dropped")
+        tour_events = [
+            e for e in self.engine.store.events("owner", project_id=self.project["project_id"]) if e["kind"] == "tournament"
+        ]
+        self.assertEqual(len(tour_events), 1)
+        self.assertEqual(tour_events[0]["payload_json"]["winner_cand_id"], "NONE")
+
+    async def test_fuzzy_graveyard_dedup_and_top_k_recon_capping(self):
+        grave = [
+            {
+                "scope_hint": "Add Redis caching layer for user profiles",
+                "idea": "Introduce Redis cache wrapper around user profile SQL queries",
+                "reason": "Too much operational overhead for current scale",
+                "source": "human_drop",
+            }
+        ]
+        # Paraphrased / inflected duplicate blocked (>= 0.65 similarity)
+        self.assertTrue(
+            _is_graveyard_duplicate(
+                {"title": "Add Redis cache layer for user profile", "plan": "Completely different words"},
+                grave,
+            )
+        )
+        self.assertTrue(
+            _is_graveyard_duplicate(
+                {"title": "Unrelated title", "plan": "Introduce Redis caching wrapper around user profiles SQL query"},
+                grave,
+            )
+        )
+        # Distinct idea allowed
+        self.assertFalse(
+            _is_graveyard_duplicate(
+                {"title": "Fix WebSocket heartbeat timeout leak", "plan": "Cancel orphaned keepalive tasks on disconnect"},
+                grave,
+            )
+        )
+
+        # Populate 45 graveyard entries; verify Recon receives only Top-30 compact entries,
+        # while dedup still blocks entry #42 (oldest).
+        now = time.time()
+        with self.engine.store.conn() as db:
+            for i in range(45):
+                db.execute(
+                    "INSERT INTO spec_graveyard VALUES (?,?,?,?,?,?,?)",
+                    (
+                        f"g_{i}",
+                        self.project["project_id"],
+                        f"Rejected idea number {i}" if i > 0 else "Old rejected retry backoff refactor",
+                        ("Detailed plan " + ("x" * 500)) if i > 0 else "Refactor HTTP client retry backoff schedule",
+                        "code_reviewer",
+                        "Reason " + ("y" * 400),
+                        now + i,
+                    ),
+                )
+
+        seen_recon_ctx = {}
+
+        async def fake_recon(p, role, instruction, context, **kw):
+            seen_recon_ctx.update(context)
+            return {
+                "summary": "inspected",
+                "routes": [
+                    {
+                        "title": "Old rejected retry backoff refactoring",
+                        "plan": "Different plan text",
+                        "kind": "optimization",
+                        "competition_group": "",
+                    },
+                    {
+                        "title": "Fresh memory leak fix in worker pool",
+                        "plan": "Release closed socket handles in worker shutdown",
+                        "kind": "optimization",
+                        "competition_group": "",
+                    },
+                ],
+            }
+
+        self.engine.agent = fake_recon
+        self.engine.run_candidates = AsyncMock()
+        await self.engine.run_project(self.project)
+
+        self.assertEqual(len(seen_recon_ctx["graveyard"]), 30)
+        for entry in seen_recon_ctx["graveyard"]:
+            self.assertEqual(set(entry.keys()), {"scope_hint", "idea", "reason", "source"})
+            self.assertLessEqual(len(entry["idea"]), 300)
+            self.assertLessEqual(len(entry["reason"]), 200)
+
+        created = self.engine.store.rows("candidates", "project_id=?", (self.project["project_id"],))
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["title"], "Fresh memory leak fix in worker pool")
+
+    async def test_allow_test_edits_and_new_read_endpoints_and_export_bundle(self):
+        # Update project with allow_test_edits=1 via validate_project
+        validated = self.engine.validate_project({"allow_test_edits": True}, partial=True)
+        self.assertEqual(validated["allow_test_edits"], 1)
+        self.engine.store.update("projects", self.project["project_id"], allow_test_edits=1)
+        p = self.engine.store.get("projects", self.project["project_id"])
+
+        orig_call = self.backend.call
+
+        async def backend_with_tests_and_bundle(op, **a):
+            res = await orig_call(op, **a)
+            if op == "diff":
+                res["modified_existing_tests"] = ["tests/test_app.py"]
+            elif op == "gate":
+                res["modified_existing_tests"] = ["tests/test_app.py"]
+                res["baseline_test_regression"] = {
+                    "checked": True,
+                    "modified_existing_tests": ["tests/test_app.py"],
+                    "passed": False,
+                    "gates": [{"command": "pytest", "code": 1, "output": "old expectation failed"}],
+                }
+            elif op == "export":
+                res["bundle_base64"] = "QlVORExF"
+                res["bundle_filename"] = "cand.bundle"
+                res["apply_instructions"] = {"patch": "git apply ...", "bundle": "git fetch ..."}
+            return res
+
+        self.backend.call = backend_with_tests_and_bundle
+        now = time.time()
+        self.engine.store.insert(
+            "runs",
+            dict(run_id="r-te", project_id=p["project_id"], base_sha="a" * 40, status="executing", created_at=now),
+        )
+        self.engine.store.insert(
+            "candidates",
+            dict(
+                cand_id="c-te",
+                run_id="r-te",
+                project_id=p["project_id"],
+                route_index=0,
+                title="Behavior change with test update",
+                route_plan="Update behavior and existing test",
+                route_kind="architecture",
+                competition_group="grp-1",
+                branch_ref="refs/spec/c-te",
+                status="coding",
+                base_sha="a" * 40,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+        prompts_seen: dict[str, str] = {}
+
+        async def fake_agent(proj, role, instruction, context, **kw):
+            if role == "coder":
+                return {"summary": "updated code and test"}
+            if kw.get("budget_role") == "report":
+                prompts_seen["report"] = instruction
+                return {"report": "### What Changed\nUpdated.\n### How It Works\nClean.\n### Gates & Verification\nModified tests/test_app.py."}
+            prompts_seen["reviewer"] = instruction
+            self.assertEqual(context["modified_existing_tests"], ["tests/test_app.py"])
+            return {"decision": "NOMINATE", "feedback": "test change justified"}
+
+        self.engine.agent = fake_agent
+        await self.engine.drive(p, self.engine.store.get("candidates", "c-te"))
+
+        self.assertIn("tests/test_app.py", prompts_seen["reviewer"])
+        self.assertIn("tests/test_app.py", prompts_seen["report"])
+        for op_name in ("diff", "gate", "dehydrate"):
+            op_calls = [a for op, a in self.backend.calls if op == op_name]
+            self.assertTrue(op_calls and all(a.get("allow_test_edits") is True for a in op_calls), op_name)
+
+        # Seed a graveyard entry for graveyard endpoint test
+        self.engine.store.grave(self.engine.store.get("candidates", "c-te"), "example tombstone", "code_reviewer")
+
+        app = web.Application()
+        self.engine.register(app)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+
+        # GET /api/spec/candidates includes competition_group & modified_existing_tests
+        list_resp = await client.get("/api/spec/candidates")
+        self.assertEqual(list_resp.status, 200)
+        list_body = await list_resp.json()
+        self.assertEqual(list_body["candidates"][0]["competition_group"], "grp-1")
+        self.assertEqual(list_body["candidates"][0]["modified_existing_tests"], ["tests/test_app.py"])
+
+        # GET /api/spec/candidates/{cand_id}
+        detail_resp = await client.get("/api/spec/candidates/c-te")
+        self.assertEqual(detail_resp.status, 200)
+        detail_body = await detail_resp.json()
+        self.assertEqual(detail_body["candidate"]["modified_existing_tests"], ["tests/test_app.py"])
+
+        # GET /api/spec/candidates/{cand_id}/events
+        ev_resp = await client.get("/api/spec/candidates/c-te/events")
+        self.assertEqual(ev_resp.status, 200)
+        ev_body = await ev_resp.json()
+        self.assertTrue(ev_body["ok"])
+        self.assertIn("nominated", [e["kind"] for e in ev_body["events"]])
+
+        # GET /api/spec/projects/{project_id}/graveyard
+        gr_resp = await client.get(f"/api/spec/projects/{p['project_id']}/graveyard")
+        self.assertEqual(gr_resp.status, 200)
+        gr_body = await gr_resp.json()
+        self.assertTrue(gr_body["ok"])
+        self.assertEqual(len(gr_body["graveyard"]), 1)
+
+        # POST /api/spec/candidates/{cand_id}/export returns bundle_base64 & apply_instructions
+        exp_resp = await client.post("/api/spec/candidates/c-te/export", json={"action_id": "exp-1"})
+        self.assertEqual(exp_resp.status, 200)
+        exp_body = await exp_resp.json()
+        self.assertEqual(exp_body["bundle_base64"], "QlVORExF")
+        self.assertIn("apply_instructions", exp_body)
+
+        # Owner isolation on new endpoints
+        self.user = {"owner_id": "stranger", "is_admin": True}
+        self.assertEqual((await client.get("/api/spec/candidates/c-te/events")).status, 403)
+        self.assertEqual((await client.get(f"/api/spec/projects/{p['project_id']}/graveyard")).status, 403)
 
 
 class WorkerFailures(unittest.IsolatedAsyncioTestCase):

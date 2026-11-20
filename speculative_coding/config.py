@@ -70,12 +70,105 @@ class ProviderEndpoint:
 
 
 @dataclass
+class RoleBudget:
+    max_steps: int
+    deadline_seconds: float
+    max_total_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        self.max_steps = max(1, int(self.max_steps))
+        self.deadline_seconds = max(1.0, float(self.deadline_seconds))
+        if self.max_total_tokens is not None:
+            tokens = int(self.max_total_tokens)
+            self.max_total_tokens = tokens if tokens > 0 else None
+
+
+DEFAULT_ROLE_BUDGETS: dict[str, RoleBudget] = {
+    "recon": RoleBudget(max_steps=20, deadline_seconds=600.0, max_total_tokens=None),
+    "coder": RoleBudget(max_steps=40, deadline_seconds=1200.0, max_total_tokens=None),
+    "reviewer": RoleBudget(max_steps=15, deadline_seconds=450.0, max_total_tokens=None),
+    "inspector": RoleBudget(max_steps=15, deadline_seconds=450.0, max_total_tokens=None),
+    "report": RoleBudget(max_steps=8, deadline_seconds=240.0, max_total_tokens=None),
+}
+
+
+def _default_role_budgets() -> dict[str, RoleBudget]:
+    return {
+        role: RoleBudget(
+            max_steps=b.max_steps,
+            deadline_seconds=b.deadline_seconds,
+            max_total_tokens=b.max_total_tokens,
+        )
+        for role, b in DEFAULT_ROLE_BUDGETS.items()
+    }
+
+
+def _coerce_role_budget(role: str, raw: Any, base: RoleBudget | None = None) -> RoleBudget:
+    fallback = base or DEFAULT_ROLE_BUDGETS.get(role) or RoleBudget(max_steps=20, deadline_seconds=600.0)
+    if isinstance(raw, RoleBudget):
+        return RoleBudget(
+            max_steps=raw.max_steps,
+            deadline_seconds=raw.deadline_seconds,
+            max_total_tokens=raw.max_total_tokens,
+        )
+    if not isinstance(raw, dict):
+        raise ValueError(f"role budget for {role!r} must be a mapping or RoleBudget")
+    max_steps = raw.get("max_steps", fallback.max_steps)
+    deadline_seconds = raw.get("deadline_seconds", fallback.deadline_seconds)
+    max_total_tokens = raw.get("max_total_tokens", fallback.max_total_tokens)
+    if isinstance(max_total_tokens, str) and not max_total_tokens.strip():
+        max_total_tokens = None
+    return RoleBudget(
+        max_steps=int(max_steps),
+        deadline_seconds=float(deadline_seconds),
+        max_total_tokens=int(max_total_tokens) if max_total_tokens is not None else None,
+    )
+
+
+def _normalize_role_budgets(raw: dict[str, Any] | None) -> dict[str, RoleBudget]:
+    budgets = _default_role_budgets()
+    if not raw:
+        return budgets
+    for role, val in raw.items():
+        key = str(role).strip().lower()
+        if not key:
+            continue
+        budgets[key] = _coerce_role_budget(key, val, base=budgets.get(key))
+    return budgets
+
+
+def _apply_env_role_budgets(budgets: dict[str, RoleBudget]) -> dict[str, RoleBudget]:
+    raw_json = os.environ.get("SPEC_ROLE_BUDGETS", "").strip()
+    if raw_json:
+        parsed = json.loads(raw_json)
+        if isinstance(parsed, dict):
+            for role, val in parsed.items():
+                key = str(role).strip().lower()
+                if key:
+                    budgets[key] = _coerce_role_budget(key, val, base=budgets.get(key))
+    for role in list(budgets.keys()):
+        prefix = f"SPEC_BUDGET_{role.upper()}_"
+        steps_raw = os.environ.get(prefix + "MAX_STEPS", "").strip()
+        deadline_raw = os.environ.get(prefix + "DEADLINE_SECONDS", "").strip()
+        tokens_raw = os.environ.get(prefix + "MAX_TOTAL_TOKENS", "").strip()
+        if steps_raw or deadline_raw or tokens_raw:
+            cur = budgets[role]
+            budgets[role] = RoleBudget(
+                max_steps=int(steps_raw) if steps_raw else cur.max_steps,
+                deadline_seconds=float(deadline_raw) if deadline_raw else cur.deadline_seconds,
+                max_total_tokens=int(tokens_raw) if tokens_raw else cur.max_total_tokens,
+            )
+    return budgets
+
+
+@dataclass
 class SpecConfig:
     """Self-contained runtime configuration for the Speculative Coding control plane."""
 
     data_dir: Path = field(default_factory=lambda: Path("./data"))
     db_path: Path | None = None
     sessions_db_path: Path | None = None
+    outbox_db_path: Path | None = None
     providers: dict[str, ProviderEndpoint] = field(default_factory=dict)
     default_provider_id: str = ""
     speculative_provider_id: str = ""
@@ -84,6 +177,7 @@ class SpecConfig:
     cooldown_fail_threshold: int = 2
     cooldown_seconds: float = 180.0
     max_cooldown_seconds: float = 1800.0
+    role_budgets: dict[str, RoleBudget] = field(default_factory=_default_role_budgets)
     worker_token: str = ""
     api_token: str = ""
     default_owner_id: str = "local"
@@ -102,7 +196,18 @@ class SpecConfig:
             self.sessions_db_path = self.data_dir / "sessions.db"
         else:
             self.sessions_db_path = Path(self.sessions_db_path)
+        if self.outbox_db_path is None:
+            self.outbox_db_path = self.data_dir / "worker_outbox.db"
+        else:
+            self.outbox_db_path = Path(self.outbox_db_path)
+        self.role_budgets = _normalize_role_budgets(self.role_budgets)
         self._sanitize_pool_defaults()
+
+    def get_role_budget(self, role: str) -> RoleBudget:
+        key = str(role or "").strip().lower()
+        if key in self.role_budgets:
+            return self.role_budgets[key]
+        return self.role_budgets.get("reviewer") or RoleBudget(max_steps=15, deadline_seconds=450.0)
 
     def _sanitize_pool_defaults(self) -> None:
         """Guarantee strict bidirectional pool isolation between main and speculative pools."""
@@ -175,10 +280,18 @@ class SpecConfig:
 
         cooldown = expanded.get("cooldown") or {}
         github = expanded.get("github_app") or {}
+        role_budgets = _apply_env_role_budgets(_default_role_budgets())
+        raw_budgets = expanded.get("role_budgets")
+        if isinstance(raw_budgets, dict):
+            for role, val in raw_budgets.items():
+                key = str(role).strip().lower()
+                if key:
+                    role_budgets[key] = _coerce_role_budget(key, val, base=role_budgets.get(key))
         return cls(
             data_dir=data_dir,
             db_path=Path(expanded["db_path"]) if expanded.get("db_path") else None,
             sessions_db_path=Path(expanded["sessions_db_path"]) if expanded.get("sessions_db_path") else None,
+            outbox_db_path=Path(expanded["outbox_db_path"]) if expanded.get("outbox_db_path") else None,
             providers=providers,
             default_provider_id=str(expanded.get("default_provider_id") or ""),
             speculative_provider_id=str(expanded.get("speculative_provider_id") or ""),
@@ -187,6 +300,7 @@ class SpecConfig:
             cooldown_fail_threshold=max(1, int(cooldown.get("failures", 2))),
             cooldown_seconds=max(5.0, float(cooldown.get("cooldown_seconds", 180.0))),
             max_cooldown_seconds=max(5.0, float(cooldown.get("max_cooldown_seconds", 1800.0))),
+            role_budgets=role_budgets,
             worker_token=str(expanded.get("worker_token") or os.environ.get("SPEC_WORKER_TOKEN", "")).strip(),
             api_token=str(expanded.get("api_token") or os.environ.get("SPEC_API_TOKEN", "")).strip(),
             default_owner_id=str(expanded.get("default_owner_id") or os.environ.get("SPEC_OWNER_ID", "local")).strip(),
@@ -232,10 +346,13 @@ class SpecConfig:
             spec_default = ep.provider_id
 
         resolved_data = data_dir or Path(os.environ.get("SPEC_DATA_DIR", "./data"))
+        outbox_raw = os.environ.get("SPEC_OUTBOX_DB_PATH", "").strip()
         return cls(
             data_dir=resolved_data,
+            outbox_db_path=Path(outbox_raw) if outbox_raw else None,
             providers=providers,
             speculative_provider_id=spec_default,
+            role_budgets=_apply_env_role_budgets(_default_role_budgets()),
             worker_token=os.environ.get("SPEC_WORKER_TOKEN", "").strip(),
             api_token=os.environ.get("SPEC_API_TOKEN", "").strip(),
             default_owner_id=os.environ.get("SPEC_OWNER_ID", "local").strip(),

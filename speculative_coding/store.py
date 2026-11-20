@@ -24,6 +24,7 @@ PROJECT_DEFAULTS = dict(
     build_concurrency=2,
     max_review_rounds=5,
     ttl_hours=72,
+    allow_test_edits=0,
     enabled=0,
     status="idle",
     speculative_tokens=0,
@@ -43,6 +44,7 @@ JSON_FIELDS = {
     "routes_json",
     "steer_notes_json",
     "preview_meta_json",
+    "modified_existing_tests_json",
     "topics_json",
     "payload_json",
     "weekdays_json",
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS spec_projects (
  routes_per_batch INTEGER NOT NULL DEFAULT 3, llm_concurrency INTEGER NOT NULL DEFAULT 6,
  wt_concurrency INTEGER NOT NULL DEFAULT 3, build_concurrency INTEGER NOT NULL DEFAULT 2,
  max_review_rounds INTEGER NOT NULL DEFAULT 5, ttl_hours INTEGER NOT NULL DEFAULT 72,
+ allow_test_edits INTEGER NOT NULL DEFAULT 0,
  enabled INTEGER NOT NULL DEFAULT 0, hot_cache_last_used REAL, status TEXT NOT NULL DEFAULT 'idle',
  speculative_tokens INTEGER NOT NULL DEFAULT 0, wake_at REAL, last_head_sha TEXT NOT NULL DEFAULT '',
  created_at REAL NOT NULL, updated_at REAL NOT NULL,
@@ -98,7 +101,8 @@ CREATE TABLE IF NOT EXISTS spec_candidates (
  drop_reason TEXT NOT NULL DEFAULT '', tokens_used INTEGER NOT NULL DEFAULT 0, expires_at REAL,
  created_at REAL NOT NULL, updated_at REAL NOT NULL, diff_text TEXT NOT NULL DEFAULT '',
  base_sha TEXT NOT NULL, head_sha TEXT NOT NULL DEFAULT '', feedback TEXT NOT NULL DEFAULT '',
- stagnant_rounds INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0);
+ stagnant_rounds INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0,
+ modified_existing_tests_json TEXT NOT NULL DEFAULT '[]');
 CREATE INDEX IF NOT EXISTS idx_spec_cand_expiry ON spec_candidates(status,expires_at);
 CREATE TABLE IF NOT EXISTS spec_graveyard (
  grave_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, scope_hint TEXT NOT NULL, idea TEXT NOT NULL,
@@ -143,6 +147,13 @@ CREATE INDEX IF NOT EXISTS idx_spec_notifications_status ON spec_notifications(s
             for name in ("repo_id", "repo_full_name", "github_installation_id"):
                 if name not in columns:
                     c.execute(f"ALTER TABLE spec_projects ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            if "allow_test_edits" not in columns:
+                c.execute("ALTER TABLE spec_projects ADD COLUMN allow_test_edits INTEGER NOT NULL DEFAULT 0")
+            cand_columns = {row[1] for row in c.execute("PRAGMA table_info(spec_candidates)")}
+            if "modified_existing_tests_json" not in cand_columns:
+                c.execute(
+                    "ALTER TABLE spec_candidates ADD COLUMN modified_existing_tests_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     @contextmanager
     def conn(self):
