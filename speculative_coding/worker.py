@@ -31,6 +31,7 @@ VALID_WORKER_OPS = frozenset(
         "dehydrate",
         "drop",
         "export",
+        "export_bundle",
         "merge",
         "status",
         "gate",
@@ -84,7 +85,9 @@ class Worker:
 
     def maintain(self):
         self.db.execute("DELETE FROM tasks WHERE response IS NOT NULL AND created<?", (time.time() - 7 * 86400,))
-        self.db.execute("DELETE FROM tasks WHERE acked=1 AND op IN ('read','grep','diff','describe','status','export')")
+        self.db.execute(
+            "DELETE FROM tasks WHERE acked=1 AND op IN ('read','grep','diff','describe','status','export','export_bundle')"
+        )
         self.db.execute(
             "UPDATE tasks SET response=? WHERE acked=1 AND op IN ('command','gate') AND length(response)>65536",
             (json.dumps({"error": "acknowledged task result evicted; retry with a new attempt ID"}),),

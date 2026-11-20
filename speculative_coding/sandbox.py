@@ -15,6 +15,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -29,6 +30,14 @@ FAST_READ_OPS = frozenset({"read", "grep", "diff", "describe", "status"})
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 _PROTECTED = {".git", ".env", ".ssh", "deploy", ".github", "AGENTS.md"}
+_TEST_DIR_NAMES = frozenset({"tests", "__tests__"})
+_TEST_CONFIG_FILES = frozenset({"conftest.py", "pytest.ini"})
+_TEST_NAME_PATTERNS = (
+    re.compile(r"^test_.+", re.IGNORECASE),
+    re.compile(r"^.+_test\.(?:py|go|rs|rb|ts|tsx|js|jsx|mjs|cjs|cpp|cc|c)$", re.IGNORECASE),
+    re.compile(r"^.+\.(?:test|spec)\.[^.]+$", re.IGNORECASE),
+    re.compile(r"^[A-Za-z0-9_]+(?:Test|Tests|Spec)\.(?:java|kt|kts|scala|cs|rs|cpp|cc|cxx|swift|rb|ts|tsx|js|jsx)$"),
+)
 _CACHE_NOISE_DIRS = frozenset(
     {
         ".git",
@@ -46,6 +55,30 @@ _CACHE_NOISE_DIRS = frozenset(
 )
 _CACHE_NOISE_FILES = frozenset({".coverage"})
 _CACHE_NOISE_SUFFIXES = (".pyc", ".pyo", ".spec-tmp")
+
+
+def _is_protected_path(rel_path: str) -> bool:
+    parts = Path(rel_path).parts
+    return any(p in _PROTECTED or p.startswith(".env") for p in parts)
+
+
+def _is_test_path(rel_path: str) -> bool:
+    raw = Path(rel_path)
+    parts = raw.parts
+    if not parts:
+        return False
+    dir_parts = [p.lower() for p in parts[:-1]]
+    if any(p in _TEST_DIR_NAMES for p in dir_parts):
+        return True
+    if dir_parts and dir_parts[0] == "test":
+        return True
+    for idx in range(len(dir_parts) - 1):
+        if dir_parts[idx] == "src" and dir_parts[idx + 1] == "test":
+            return True
+    name = parts[-1]
+    if name.lower() in _TEST_CONFIG_FILES:
+        return True
+    return any(pattern.fullmatch(name) for pattern in _TEST_NAME_PATTERNS)
 
 
 def _is_cache_noise(rel_path: str) -> bool:
@@ -66,8 +99,9 @@ class SpecSandboxBackend(ABC):
 class RemoteWorkerSandbox(SpecSandboxBackend):
     """Reconnect resends stable IDs. Pure read-only queries bypass SQLite outbox overhead."""
 
-    def __init__(self, journal_path: Path | str | None = None):
+    def __init__(self, journal_path: Path | str | None = None, *, max_outbox_bytes: int = 256 * 1024**2):
         self.journal_path = Path(journal_path) if journal_path else None
+        self.max_outbox_bytes = max(1, int(max_outbox_bytes))
         self._consume_ticks = 0
         if self.journal_path:
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +135,7 @@ class RemoteWorkerSandbox(SpecSandboxBackend):
             "last_seen": self.last_seen,
             "metrics": self.metrics,
             "pending_tasks": len(self.pending),
+            "outbox_db": str(self.journal_path) if self.journal_path else "",
         }
 
     async def call(self, operation: str, **arguments: Any) -> dict:
@@ -148,12 +183,20 @@ class RemoteWorkerSandbox(SpecSandboxBackend):
                 else:
                     payload = {"id": task_id, "op": operation, "args": arguments}
                     raw_payload = json.dumps(payload, ensure_ascii=False)
-                    page_count = db.execute("PRAGMA page_count").fetchone()[0]
-                    page_size = db.execute("PRAGMA page_size").fetchone()[0]
-                    free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
-                    used = max(0, (page_count - free_pages) * page_size)
-                    if used + len(raw_payload.encode()) >= 256 * 1024**2:
-                        raise RuntimeError("control-plane outbox budget exhausted")
+                    # Recovery/cleanup drops must never deadlock when the outbox budget is tight.
+                    if operation != "drop":
+                        payload_size = len(raw_payload.encode())
+                        page_count = db.execute("PRAGMA page_count").fetchone()[0]
+                        page_size = db.execute("PRAGMA page_size").fetchone()[0]
+                        free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+                        used = max(0, (page_count - free_pages) * page_size)
+                        if used + payload_size >= self.max_outbox_bytes:
+                            db.execute("DELETE FROM spec_worker_tasks WHERE status='consumed'")
+                            page_count = db.execute("PRAGMA page_count").fetchone()[0]
+                            free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+                            used = max(0, (page_count - free_pages) * page_size)
+                            if used + payload_size >= self.max_outbox_bytes:
+                                raise RuntimeError("control-plane outbox budget exhausted")
                     db.execute(
                         "INSERT INTO spec_worker_tasks VALUES (?,?,?,NULL,?,?) "
                         "ON CONFLICT(task_id) DO UPDATE SET payload_json=excluded.payload_json,response_json=NULL,status='queued'",
@@ -293,6 +336,7 @@ class LocalDirSandbox(SpecSandboxBackend):
         self._processes: set[asyncio.subprocess.Process] = set()
         self.baseline_leases: Counter = Counter()
         self.baseline_lock = asyncio.Lock()
+        self._baseline_build_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.high_pressure_slot = asyncio.Lock()
         self.project_build_slots: dict[tuple[str, int], asyncio.Semaphore] = {}
         self._dedicated_mount = os.path.ismount(self.root)
@@ -311,6 +355,9 @@ class LocalDirSandbox(SpecSandboxBackend):
         cid = self._id(cand_id)
         return self._wt_locks.setdefault(cid, asyncio.Lock())
 
+    def _baseline_build_lock(self, project_id: str, digest: str) -> asyncio.Lock:
+        return self._baseline_build_locks.setdefault((self._id(project_id), digest), asyncio.Lock())
+
     def _id(self, value) -> str:
         if not _ID.fullmatch(str(value)):
             raise ValueError("invalid sandbox identifier")
@@ -328,20 +375,15 @@ class LocalDirSandbox(SpecSandboxBackend):
             raise ValueError("escaping worktree")
         return path
 
-    def _file(self, wt: Path, name: str, *, write: bool = False) -> Path:
+    def _file(self, wt: Path, name: str, *, write: bool = False, allow_test_edits: bool = False) -> Path:
         raw = Path(name)
-        if (
-            not raw.parts
-            or raw.is_absolute()
-            or ".." in raw.parts
-            or any(p in _PROTECTED or p.startswith(".env") for p in raw.parts)
-        ):
+        if not raw.parts or raw.is_absolute() or ".." in raw.parts or _is_protected_path(name):
             raise ValueError("protected or escaping path")
         path = wt / raw
         if path.is_symlink() or not path.resolve().is_relative_to(wt.resolve()):
             raise ValueError("symlink/escaping path")
-        if write and (raw.parts[0] == "tests" or raw.name.startswith("test_")):
-            # Tests may be added, but never changed/deleted to make gates pass.
+        if write and not allow_test_edits and _is_test_path(name):
+            # Tests may be added, but never changed/deleted unless allow_test_edits is opted-in.
             if path.exists():
                 raise ValueError("existing tests are immutable")
         return path
@@ -743,7 +785,7 @@ class LocalDirSandbox(SpecSandboxBackend):
                         return await (self._gate(a) if operation == "gate" else self._command(a))
                 return await (self._gate(a) if operation == "gate" else self._command(a))
         # Read-only inspections run concurrently without serializing behind git fetch/gc.
-        if operation in {"describe", "read", "grep", "export"}:
+        if operation in {"describe", "read", "grep", "export", "export_bundle"}:
             return await self._operation(operation, a)
         if operation in {"write", "edit", "diff"}:
             async with self._wt_lock(a["cand_id"]):
@@ -783,6 +825,8 @@ class LocalDirSandbox(SpecSandboxBackend):
             if lease:
                 async with self.baseline_lock:
                     self.baseline_leases[lease] -= 1
+                    if self.baseline_leases[lease] <= 0:
+                        self.baseline_leases.pop(lease, None)
 
     async def _clean(self, wt: Path):
         await self._git(wt, "clean", "-ffd", "-x")
@@ -795,6 +839,11 @@ class LocalDirSandbox(SpecSandboxBackend):
             return (
                 "pnpm install --offline --frozen-lockfile --ignore-scripts --store-dir /cache/pnpm-store",
                 "pnpm install --frozen-lockfile --ignore-scripts --store-dir /cache/pnpm-store",
+            )
+        if (package_root / "yarn.lock").exists():
+            return (
+                "yarn install --offline --frozen-lockfile --ignore-scripts --cache-folder /cache/yarn",
+                "yarn install --frozen-lockfile --ignore-scripts --cache-folder /cache/yarn",
             )
         if (package_root / "package-lock.json").exists():
             return (
@@ -819,7 +868,7 @@ class LocalDirSandbox(SpecSandboxBackend):
     async def _baseline(self, a, wt: Path):
         """One immutable dependency baseline per project/manifest digest."""
         tracked = [name for name in (await self._git(wt, "ls-files", "-z")).split("\0") if name]
-        lock_names = {"package-lock.json", "pnpm-lock.yaml", "uv.lock"}
+        lock_names = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "uv.lock"}
         include_py_manifests = self.auto_seed_deps or not self.unsafe_test_mode
         if include_py_manifests:
             manifest_names = lock_names | {"requirements.txt", "pyproject.toml"}
@@ -849,16 +898,32 @@ class LocalDirSandbox(SpecSandboxBackend):
         digest = hashlib.sha256(
             b"".join(str(p.relative_to(wt)).encode() + b"\0" + p.read_bytes() for p in sorted(locks))
         ).hexdigest()
-        parent = self.root / "golden_bases" / self._id(a["project_id"])
+        pid = self._id(a["project_id"])
+        parent = self.root / "golden_bases" / pid
         baseline = parent / digest
+
+        # Fast path: only hold global baseline_lock for quick ready check + lease increment.
         async with self.baseline_lock:
             if (baseline / "ready").exists():
                 parent.touch()
                 self.baseline_leases[parent] += 1
                 return baseline
-            parent.mkdir(exist_ok=True)
-            baseline.mkdir(exist_ok=True)
-            self.baseline_leases[parent] += 1
+
+        # Slow path: serialize installation only per-(project_id, digest), never holding
+        # global baseline_lock across potentially 900s dependency installation.
+        build_lock = self._baseline_build_lock(pid, digest)
+        async with build_lock:
+            async with self.baseline_lock:
+                if (baseline / "ready").exists():
+                    parent.touch()
+                    self.baseline_leases[parent] += 1
+                    return baseline
+                parent.mkdir(exist_ok=True)
+                baseline.mkdir(exist_ok=True)
+                # Hold a lease across installation so high-pressure LRU eviction never removes parent.
+                self.baseline_leases[parent] += 1
+
+            succeeded = False
             try:
                 roots = {p.parent for p in locks}
                 for package_root in sorted(roots):
@@ -895,28 +960,93 @@ class LocalDirSandbox(SpecSandboxBackend):
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             await asyncio.to_thread(shutil.move, str(dependency), str(destination))
                 (baseline / "ready").write_text(str(time.time()))
-                parent.touch()
-                self._invalidate_disk_cache()
+                async with self.baseline_lock:
+                    parent.touch()
+                    self._invalidate_disk_cache()
+                succeeded = True
+                return baseline
             except BaseException:
                 self._immutable_sizes.pop(baseline, None)
                 await asyncio.to_thread(shutil.rmtree, baseline, True)
                 await self._clean(wt)
                 raise
             finally:
-                self.baseline_leases[parent] -= 1
-            self.baseline_leases[parent] += 1
-        return baseline
+                if not succeeded:
+                    async with self.baseline_lock:
+                        self.baseline_leases[parent] -= 1
+                        if self.baseline_leases[parent] <= 0:
+                            self.baseline_leases.pop(parent, None)
+
+    async def _run_baseline_test_regression(
+        self, a: dict, wt: Path, baseline: Path | None, modified_existing_tests: list[str]
+    ) -> dict[str, Any]:
+        """Run gate commands against base_sha versions of modified existing test files, then restore candidate tests."""
+        base_sha = str(a["base_sha"])
+        commands = list(a.get("commands", []))
+        saved_files: list[tuple[str, bytes | None]] = []
+        async with self._wt_lock(a["cand_id"]):
+            base_tree_files = set((await self._git(wt, "ls-tree", "-r", "--name-only", base_sha)).splitlines())
+            to_checkout: list[str] = []
+            for rel in modified_existing_tests:
+                path = self._file(wt, rel, write=True, allow_test_edits=True)
+                saved_files.append((rel, path.read_bytes() if path.is_file() else None))
+                if rel in base_tree_files:
+                    to_checkout.append(rel)
+                elif path.is_file():
+                    path.unlink(missing_ok=True)
+            if to_checkout:
+                await self._git(wt, "checkout", base_sha, "--", *to_checkout)
+
+        baseline_evidence: list[dict[str, Any]] = []
+        baseline_passed = True
+        try:
+            for command in commands:
+                res = await self._exec(
+                    self._command_argv(command),
+                    cwd=wt,
+                    sandbox=True,
+                    baseline=baseline,
+                    timeout=900,
+                    output_limit=2 * 1024 * 1024,
+                )
+                baseline_evidence.append({"command": command, **res})
+                if res["code"]:
+                    baseline_passed = False
+                    break
+        finally:
+            async with self._wt_lock(a["cand_id"]):
+                for rel, content in saved_files:
+                    path = self._file(wt, rel, write=True, allow_test_edits=True)
+                    if content is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(content)
+                await self._stage_candidate_changes(wt)
+        return {
+            "checked": True,
+            "modified_existing_tests": list(modified_existing_tests),
+            "passed": baseline_passed,
+            "gates": baseline_evidence,
+        }
 
     async def _gate(self, a):
         wt = self._wt(a["cand_id"])
         if not wt.is_dir():
             raise ValueError("candidate is not hydrated")
         async with self._wt_lock(a["cand_id"]):
-            await self._operation("diff", a)
+            diff_info = await self._operation("diff", a)
+        modified_existing_tests = list(diff_info.get("modified_existing_tests") or [])
         baseline = await self._baseline(a, wt)
         lease = baseline.parent if baseline else None
         evidence = []
+        baseline_test_regression: dict[str, Any] | None = None
+        passed = False
         try:
+            if modified_existing_tests:
+                baseline_test_regression = await self._run_baseline_test_regression(
+                    a, wt, baseline, modified_existing_tests
+                )
             for command in a.get("commands", []):
                 result = await self._exec(
                     self._command_argv(command),
@@ -928,7 +1058,14 @@ class LocalDirSandbox(SpecSandboxBackend):
                 )
                 evidence.append({"command": command, **result})
                 if result["code"]:
-                    return {"passed": False, "gates": evidence}
+                    out: dict[str, Any] = {
+                        "passed": False,
+                        "gates": evidence,
+                        "modified_existing_tests": modified_existing_tests,
+                    }
+                    if baseline_test_regression is not None:
+                        out["baseline_test_regression"] = baseline_test_regression
+                    return out
             preview = None
             if a.get("preview_command"):
                 preview = await self._exec(
@@ -940,7 +1077,15 @@ class LocalDirSandbox(SpecSandboxBackend):
                     output_limit=2 * 1024 * 1024,
                 )
                 if preview["code"]:
-                    return {"passed": False, "gates": evidence, "preview": preview}
+                    out = {
+                        "passed": False,
+                        "gates": evidence,
+                        "preview": preview,
+                        "modified_existing_tests": modified_existing_tests,
+                    }
+                    if baseline_test_regression is not None:
+                        out["baseline_test_regression"] = baseline_test_regression
+                    return out
             artifacts = []
             folder = wt / ".spec-preview"
             size = 0
@@ -956,12 +1101,32 @@ class LocalDirSandbox(SpecSandboxBackend):
                     artifacts.append(
                         {"path": str(path.relative_to(folder)), "base64": base64.b64encode(path.read_bytes()).decode()}
                     )
-            return {"passed": True, "gates": evidence, "preview": preview, "artifacts": artifacts}
+            passed = True
+            out = {
+                "passed": True,
+                "gates": evidence,
+                "preview": preview,
+                "artifacts": artifacts,
+                "modified_existing_tests": modified_existing_tests,
+            }
+            if baseline_test_regression is not None:
+                out["baseline_test_regression"] = baseline_test_regression
+            return out
         finally:
             if lease:
                 async with self.baseline_lock:
                     self.baseline_leases[lease] -= 1
-            await self._clean(wt)
+                    if self.baseline_leases[lease] <= 0:
+                        self.baseline_leases.pop(lease, None)
+            if passed:
+                await self._clean(wt)
+            else:
+                # Preserve incremental build/test caches across iterative revising rounds;
+                # only clear temporary preview outputs on failed gates.
+                preview_dir = wt / ".spec-preview"
+                if preview_dir.exists() and not preview_dir.is_symlink():
+                    await asyncio.to_thread(shutil.rmtree, preview_dir, True)
+                self._invalidate_disk_cache()
 
     @staticmethod
     def _apply_edit(original: str, target: str, replacement: str, *, replace_all: bool = False) -> tuple[str, int]:
@@ -1157,12 +1322,19 @@ class LocalDirSandbox(SpecSandboxBackend):
                     if result["code"]:
                         raise RuntimeError(result["output"])
                 branch = str(a.get("target_branch", "master"))
+                sync_strategy = str(a.get("sync_strategy") or "preserve_local")
+                if sync_strategy not in {"preserve_local", "fast_forward_only", "reset_to_upstream"}:
+                    raise ValueError("unsupported sync_strategy")
                 if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._/-]*", branch) or ".." in branch or "//" in branch or branch.endswith(("/", ".lock", ".")):
                     await self._git(repo, "check-ref-format", "--branch", branch)
                 target = "refs/heads/" + branch
                 tracking = "refs/remotes/origin/" + branch
                 if fresh_clone:
                     sha = await self._git(repo, "rev-parse", target)
+                    remote = sha
+                    diverged_from_upstream = False
+                    ahead_of_upstream = 0
+                    behind_upstream = 0
                     _, tree, logs = await asyncio.gather(
                         self._git(repo, "update-ref", tracking, sha),
                         self._git(repo, "ls-tree", "-r", "--name-only", sha),
@@ -1174,17 +1346,47 @@ class LocalDirSandbox(SpecSandboxBackend):
                     previous_sha = previous["output"].strip() if previous["code"] == 0 else current
                     await self._git(repo, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*", **auth)
                     remote = await self._git(repo, "rev-parse", tracking)
-                    if current == previous_sha and remote != current:
+                    if sync_strategy == "reset_to_upstream":
+                        if remote != current:
+                            await self._git(repo, "update-ref", target, remote, current)
+                        sha = remote
+                    elif current == previous_sha and remote != current:
                         await self._git(repo, "update-ref", target, remote, current)
                         sha = remote
+                    elif sync_strategy == "fast_forward_only" and remote != current:
+                        anc = await self._exec(["git", "-C", str(repo), "merge-base", "--is-ancestor", current, remote])
+                        if anc["code"] == 0:
+                            await self._git(repo, "update-ref", target, remote, current)
+                            sha = remote
+                        else:
+                            sha = current
                     else:
-                        sha = await self._git(repo, "rev-parse", target)
+                        sha = current
+                    if sha == remote:
+                        diverged_from_upstream = False
+                        ahead_of_upstream = 0
+                        behind_upstream = 0
+                    else:
+                        counts = await self._git(repo, "rev-list", "--left-right", "--count", f"{sha}...{remote}")
+                        count_parts = counts.split()
+                        ahead_of_upstream = int(count_parts[0]) if len(count_parts) >= 1 else 0
+                        behind_upstream = int(count_parts[1]) if len(count_parts) >= 2 else 0
+                        diverged_from_upstream = True
                     tree, logs = await asyncio.gather(
                         self._git(repo, "ls-tree", "-r", "--name-only", sha),
                         self._git(repo, "log", "-12", "--oneline", sha),
                     )
                 self._invalidate_disk_cache()
-                return {"base_sha": sha, "tree": tree, "recent_commits": logs}
+                return {
+                    "base_sha": sha,
+                    "upstream_sha": remote,
+                    "diverged_from_upstream": diverged_from_upstream,
+                    "ahead_of_upstream": ahead_of_upstream,
+                    "behind_upstream": behind_upstream,
+                    "sync_strategy": sync_strategy,
+                    "tree": tree,
+                    "recent_commits": logs,
+                }
         if not repo.is_dir():
             raise ValueError("unknown project repository")
         if op == "describe":
@@ -1237,7 +1439,8 @@ class LocalDirSandbox(SpecSandboxBackend):
         if op == "write":
             if not wt or not wt.is_dir():
                 raise ValueError("candidate is not hydrated")
-            path = self._file(wt, a["path"], write=True)
+            allow_test_edits = bool(a.get("allow_test_edits", False))
+            path = self._file(wt, a["path"], write=True, allow_test_edits=allow_test_edits)
             path.parent.mkdir(parents=True, exist_ok=True)
             temp = path.with_name(path.name + ".spec-tmp")
             temp.write_text(a["content"], encoding="utf-8")
@@ -1248,7 +1451,8 @@ class LocalDirSandbox(SpecSandboxBackend):
         if op == "edit":
             if not wt or not wt.is_dir():
                 raise ValueError("candidate is not hydrated")
-            path = self._file(wt, a["path"], write=True)
+            allow_test_edits = bool(a.get("allow_test_edits", False))
+            path = self._file(wt, a["path"], write=True, allow_test_edits=allow_test_edits)
             if not path.is_file():
                 raise ValueError("file does not exist; use write to create new files")
             original = path.read_text(encoding="utf-8")
@@ -1265,19 +1469,32 @@ class LocalDirSandbox(SpecSandboxBackend):
             self._invalidate_disk_cache()
             return {"edited": a["path"], "replacements": count}
         if op == "diff":
+            allow_test_edits = bool(a.get("allow_test_edits", False))
             await self._stage_candidate_changes(wt)
             diff, names = await asyncio.gather(
                 self._git(wt, "diff", "--cached", "--binary", a["base_sha"]),
                 self._git(wt, "diff", "--cached", "--name-status", a["base_sha"]),
             )
+            modified_existing_tests: list[str] = []
             for line in names.splitlines():
-                action, name = line.split("\t", 1)
-                raw = Path(name)
-                if any(p in _PROTECTED or p.startswith(".env") for p in raw.parts) or (
-                    action != "A" and (raw.parts[0] == "tests" or raw.name.startswith("test_"))
-                ):
-                    raise ValueError("candidate changed protected paths/tests")
-            return {"diff": diff, "hash": hashlib.sha256(diff.encode()).hexdigest()}
+                parts = line.split("\t")
+                action = parts[0]
+                paths_in_line = parts[1:]
+                for name in paths_in_line:
+                    if _is_protected_path(name):
+                        raise ValueError("candidate changed protected paths/tests")
+                if action != "A":
+                    for name in paths_in_line:
+                        if _is_test_path(name):
+                            if not allow_test_edits:
+                                raise ValueError("candidate changed protected paths/tests")
+                            if name not in modified_existing_tests:
+                                modified_existing_tests.append(name)
+            return {
+                "diff": diff,
+                "hash": hashlib.sha256(diff.encode()).hexdigest(),
+                "modified_existing_tests": modified_existing_tests,
+            }
         if op == "dehydrate":
             ref = "refs/spec/" + a["cand_id"]
             existing = await self._exec(["git", "-C", str(repo), "rev-parse", "--verify", ref])
@@ -1322,11 +1539,48 @@ class LocalDirSandbox(SpecSandboxBackend):
             self._wt_locks.pop(self._id(a["cand_id"]), None)
             self._invalidate_disk_cache()
             return {"dropped": True}
-        if op == "export":
-            ref = "refs/spec/" + self._id(a["cand_id"])
-            patch = await self._git(repo, "diff", "--binary", a["base_sha"], ref)
+        if op in {"export", "export_bundle"}:
+            cand_id_safe = self._id(a["cand_id"])
+            ref = "refs/spec/" + cand_id_safe
+            base_sha = str(a["base_sha"])
+            if not re.fullmatch(r"[0-9a-f]{40,64}", base_sha):
+                raise ValueError("invalid base SHA")
+            patch = await self._git(repo, "diff", "--binary", base_sha, ref)
             sha = await self._git(repo, "rev-parse", ref)
-            return {"patch": patch, "head_sha": sha, "base_sha": a["base_sha"]}
+            include_bundle = True if op == "export_bundle" else bool(a.get("include_bundle", True))
+            bundle_filename = f"{cand_id_safe}.bundle"
+            patch_filename = f"{cand_id_safe}.patch"
+            apply_instructions = {
+                "patch": f"git apply --3way {patch_filename}",
+                "bundle": (
+                    f"git bundle verify {bundle_filename} && "
+                    f"git fetch {bundle_filename} {ref}:refs/heads/spec/{cand_id_safe} && "
+                    f"git checkout spec/{cand_id_safe}"
+                ),
+            }
+            response: dict[str, Any] = {
+                "patch": patch,
+                "head_sha": sha,
+                "base_sha": base_sha,
+                "branch_ref": ref,
+                "apply_instructions": apply_instructions,
+            }
+            if include_bundle:
+                response["bundle_filename"] = bundle_filename
+                if sha == base_sha:
+                    response["bundle_base64"] = ""
+                    response["bundle_error"] = "candidate head matches base_sha; no commits to bundle"
+                else:
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        bundle_tmp = Path(tmpdir) / bundle_filename
+                        await self._git(repo, "bundle", "create", str(bundle_tmp), f"{base_sha}..{ref}")
+                        raw_bundle = await asyncio.to_thread(bundle_tmp.read_bytes)
+                    if len(raw_bundle) > 16 * 1024**2:
+                        response["bundle_base64"] = ""
+                        response["bundle_error"] = "bundle exceeds 16MiB transport limit; use patch"
+                    else:
+                        response["bundle_base64"] = base64.b64encode(raw_bundle).decode("ascii")
+            return response
         if op == "merge":
             branch = str(a["target_branch"])
             await self._git(repo, "check-ref-format", "--branch", branch)

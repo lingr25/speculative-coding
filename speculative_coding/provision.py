@@ -8,19 +8,40 @@ from pathlib import PurePosixPath
 
 
 def infer_gate_commands(tree: str, files: dict[str, str]) -> list[str]:
-    paths = set(tree.splitlines()) | set(files)
+    paths = set(line.strip() for line in tree.splitlines() if line.strip()) | set(files)
     commands: list[str] = []
+
     python_project = any(
         marker in files for marker in ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile")
-    )
-    python_tests = any(
-        path.startswith("tests/") and PurePosixPath(path).name.startswith("test_") and path.endswith(".py")
+    ) or ("uv.lock" in paths and ("pyproject.toml" in files or "uv.lock" in files))
+    python_tests_in_dir = any(
+        path.startswith("tests/")
+        and path.endswith(".py")
+        and (PurePosixPath(path).name.startswith("test_") or PurePosixPath(path).name.endswith("_test.py"))
         for path in paths
     )
-    if python_project and python_tests:
-        commands.append("python -m pytest tests -q --disable-warnings --tb=short")
+    python_tests_anywhere = python_tests_in_dir or any(
+        path.endswith(".py")
+        and (PurePosixPath(path).name.startswith("test_") or PurePosixPath(path).name.endswith("_test.py"))
+        for path in paths
+    )
+    if python_project and python_tests_anywhere:
+        target = "tests " if python_tests_in_dir else ""
+        if "uv.lock" in paths:
+            commands.append(f"uv run --offline --no-sync pytest {target}-q --disable-warnings --tb=short")
+        else:
+            commands.append(f"python -m pytest {target}-q --disable-warnings --tb=short")
 
-    package_files = sorted(path for path in paths if path == "package.json" or path.endswith("/package.json"))
+    if "go.mod" in files:
+        commands.append("go test ./...")
+
+    if "Cargo.toml" in files:
+        commands.append("cargo test")
+
+    package_files = sorted(
+        (path for path in paths if path == "package.json" or path.endswith("/package.json")),
+        key=lambda p: (p.count("/"), p),
+    )
     for package_path in package_files[:6]:
         raw = files.get(package_path)
         if not raw:
@@ -32,19 +53,50 @@ def infer_gate_commands(tree: str, files: dict[str, str]) -> list[str]:
         scripts = package.get("scripts") or {}
         directory = str(PurePosixPath(package_path).parent)
         prefix = "" if directory == "." else directory + "/"
-        if "package-lock.json" not in paths and prefix + "package-lock.json" not in paths:
+
+        manager = ""
+        for lock_name, mgr in (
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+            ("package-lock.json", "npm"),
+        ):
+            if prefix + lock_name in paths:
+                manager = mgr
+                break
+        if not manager:
+            for lock_name, mgr in (
+                ("pnpm-lock.yaml", "pnpm"),
+                ("yarn.lock", "yarn"),
+                ("package-lock.json", "npm"),
+            ):
+                if lock_name in paths:
+                    manager = mgr
+                    break
+        if not manager:
             continue
+
         for script in ("test", "build"):
             if script not in scripts:
                 continue
-            if directory == ".":
-                command = "npm test" if script == "test" else "npm run build"
+            if manager == "pnpm":
+                if directory == ".":
+                    command = "pnpm test" if script == "test" else "pnpm run build"
+                else:
+                    command = f"pnpm --dir {directory} test" if script == "test" else f"pnpm --dir {directory} run build"
+            elif manager == "yarn":
+                if directory == ".":
+                    command = "yarn test" if script == "test" else "yarn run build"
+                else:
+                    command = f"yarn --cwd {directory} test" if script == "test" else f"yarn --cwd {directory} run build"
             else:
-                command = (
-                    f"npm --prefix {directory} test"
-                    if script == "test"
-                    else f"npm --prefix {directory} run build"
-                )
+                if directory == ".":
+                    command = "npm test" if script == "test" else "npm run build"
+                else:
+                    command = (
+                        f"npm --prefix {directory} test"
+                        if script == "test"
+                        else f"npm --prefix {directory} run build"
+                    )
             commands.append(command)
     return commands[:6]
 
@@ -55,12 +107,26 @@ class SpecProvisioner:
         self.store = engine.store
 
     async def _read_manifests(self, project: dict, prepared: dict) -> dict[str, str]:
-        tree = prepared.get("tree") or ""
-        wanted = {"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile"}
-        wanted.update(path for path in tree.splitlines() if path == "package.json" or path.endswith("/package.json"))
-        wanted.update(path for path in tree.splitlines() if path.startswith("tests/") and path.endswith(".py"))
+        tree_lines = [line.strip() for line in (prepared.get("tree") or "").splitlines() if line.strip()]
+        tree_set = set(tree_lines)
+        root_manifests = (
+            "requirements.txt",
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "Pipfile",
+            "go.mod",
+            "Cargo.toml",
+        )
+        wanted: list[str] = [name for name in root_manifests if not tree_set or name in tree_set]
+        wanted.extend(
+            sorted(
+                (path for path in tree_set if path == "package.json" or path.endswith("/package.json")),
+                key=lambda p: (p.count("/"), p),
+            )
+        )
         files: dict[str, str] = {}
-        for path in sorted(wanted)[:20]:
+        for path in wanted[:20]:
             try:
                 result = await self.engine.backend.call(
                     "read", project_id=project["project_id"], base_sha=prepared["base_sha"], path=path
