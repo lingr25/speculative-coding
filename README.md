@@ -1,5 +1,7 @@
 # Speculative Coding
 
+注：这是一个玩具级的小东西，仅展示设计理念，不推荐任何人拿来使用
+
 > **用富余算力换代码质量与架构探索的 24 小时自主投机编码引擎**
 >
 > *An autonomous, dual-node speculative coding engine built around surplus-token exploration, zero-trust sandbox isolation, ref-only dehydration, strict LLM pool isolation, and human-only merge authority.*
