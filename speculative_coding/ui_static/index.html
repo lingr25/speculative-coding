@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Speculative Coding — Review Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23161616'/%3E%3Cpath d='M9 11l6-3 8 4-6 3-8-4zm0 6l8 4 6-3m-14 4l8 4 6-3' fill='none' stroke='%234b8bf5' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- Top Health & Auth Header -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="btn-toggle-sidebar" class="icon-btn mobile-only" type="button" title="Toggle Projects Sidebar" aria-label="Toggle Projects Sidebar">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+          </span>
+          <span class="brand-title">Speculative Coding</span>
+          <span class="brand-tag">Review Console</span>
+        </div>
+      </div>
+
+      <div class="topbar-telemetry" id="health-bar">
+        <div class="telemetry-pill" id="worker-pill" title="Sandbox Worker connection status">
+          <span class="status-dot dot-muted" id="worker-dot"></span>
+          <span class="pill-label">Worker</span>
+          <strong id="worker-state">Checking…</strong>
+        </div>
+
+        <div class="telemetry-pill disk-pill" id="disk-pill" title="Sandbox disk pool pressure">
+          <span class="pill-label">Disk</span>
+          <div class="gauge-track" aria-hidden="true">
+            <div class="gauge-fill" id="disk-gauge-fill" style="width: 0%"></div>
+          </div>
+          <span class="badge badge-muted" id="disk-pressure-badge">unknown</span>
+          <span class="mono-subtle" id="disk-usage-text"></span>
+        </div>
+
+        <div class="telemetry-pill" title="Active sandbox worktrees">
+          <span class="pill-label">Worktrees</span>
+          <strong class="mono" id="worktree-count">0</strong>
+        </div>
+
+        <div class="telemetry-pill" title="Cumulative speculative tokens consumed across projects">
+          <span class="pill-label">Spec Tokens</span>
+          <strong class="mono" id="total-tokens">0</strong>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="btn-refresh" class="btn btn-ghost btn-sm" type="button" title="Refresh status, projects &amp; candidates (R)">
+          <svg class="icon-spin-target" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span>Refresh</span>
+        </button>
+
+        <button id="btn-theme" class="icon-btn" type="button" title="Toggle theme (Light / Dark / System)" aria-label="Toggle theme">
+          <svg id="theme-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
+
+        <button id="btn-agent-drawer" class="btn btn-secondary btn-sm" type="button" title="Open SpecAgent Delegation Chat">
+          <span class="status-dot dot-muted" id="agent-ws-dot"></span>
+          <span>SpecAgent</span>
+        </button>
+
+        <button id="btn-auth" class="icon-btn" type="button" title="Authentication / Bearer Token" aria-label="Authentication">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main 3-Pane Workspace -->
+    <main class="workspace">
+      <!-- Left Sidebar: Projects -->
+      <aside class="pane pane-projects" id="projects-pane">
+        <div class="pane-header">
+          <div class="pane-title-row">
+            <h2>Projects</h2>
+            <span class="count-pill" id="projects-count">0</span>
+          </div>
+          <button id="btn-new-project" class="btn btn-primary btn-xs" type="button">+ New</button>
+        </div>
+
+        <div class="pane-scroll" id="projects-list">
+          <div class="empty-inline">Loading projects…</div>
+        </div>
+      </aside>
+
+      <!-- Middle Column: Candidate Review Queue -->
+      <section class="pane pane-queue" aria-label="Candidates Review Queue">
+        <div class="pane-header queue-header">
+          <div class="pane-title-row">
+            <h2>Review Queue</h2>
+            <span class="count-pill" id="candidates-count">0</span>
+          </div>
+          <div class="queue-controls">
+            <div class="filter-pills" id="status-filter-bar" role="tablist" aria-label="Filter candidates by status">
+              <button class="filter-pill active" data-status="all" type="button">All</button>
+              <button class="filter-pill" data-status="staged" type="button">Staged</button>
+              <button class="filter-pill" data-status="kept" type="button">Kept</button>
+              <button class="filter-pill" data-status="active" type="button">Active</button>
+              <button class="filter-pill" data-status="merged" type="button">Merged</button>
+            </div>
+            <input id="candidate-search" class="input input-sm" type="search" placeholder="Filter by title, group, or ID…" autocomplete="off" />
+          </div>
+        </div>
+
+        <div class="pane-scroll" id="candidates-list">
+          <div class="empty-inline">No candidates yet.</div>
+        </div>
+      </section>
+
+      <!-- Right Main Area: 3-Minute Candidate Inspector -->
+      <section class="pane pane-inspector" id="inspector-pane" aria-label="Candidate Inspector">
+        <div class="inspector-empty" id="inspector-empty">
+          <div class="empty-card">
+            <div class="empty-icon" aria-hidden="true">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            </div>
+            <h3>Select a candidate to review</h3>
+            <p>Review the concise human report, inspect the colorized diff &amp; deterministic gate evidence, preview runtime artifacts, then decide: <strong>Keep</strong>, <strong>Steer</strong>, <strong>Drop</strong>, <strong>Export</strong>, or <strong>CAS Merge</strong>.</p>
+            <div class="shortcut-hints">
+              <span><kbd>J</kbd>/<kbd>K</kbd> Navigate queue</span>
+              <span><kbd>1</kbd>–<kbd>4</kbd> Switch tabs</span>
+              <span><kbd>R</kbd> Refresh</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="inspector-content hidden" id="inspector-content">
+          <div class="inspector-header">
+            <div class="inspector-title-block">
+              <div class="inspector-badges" id="inspector-badges"></div>
+              <h1 class="inspector-title" id="inspector-title"></h1>
+              <div class="inspector-meta" id="inspector-meta"></div>
+            </div>
+
+            <div class="inspector-actions" id="inspector-actions">
+              <button class="btn btn-secondary btn-sm" id="act-keep" type="button" title="Freeze TTL and retain candidate">Keep</button>
+              <button class="btn btn-secondary btn-sm" id="act-steer" type="button" title="Rehydrate and send revision guidance">Steer</button>
+              <button class="btn btn-danger-outline btn-sm" id="act-drop" type="button" title="Discard candidate and record in graveyard">Drop</button>
+              <button class="btn btn-secondary btn-sm" id="act-export" type="button" title="Export unified patch &amp; git bundle">Export</button>
+              <button class="btn btn-primary btn-sm" id="act-merge" type="button" title="Local SHA-pinned CAS merge (never auto-pushed)">Merge…</button>
+            </div>
+          </div>
+
+          <div class="test-warning-banner hidden" id="test-warning-banner" role="alert"></div>
+
+          <div class="inspector-tabs" role="tablist" aria-label="Candidate Inspector Sections">
+            <button class="tab-btn active" data-tab="report" role="tab" aria-selected="true" type="button">Report</button>
+            <button class="tab-btn" data-tab="diff" role="tab" aria-selected="false" type="button">
+              <span>Diff</span>
+              <span class="tab-badge hidden" id="tab-diff-count"></span>
+            </button>
+            <button class="tab-btn" data-tab="evidence" role="tab" aria-selected="false" type="button">
+              <span>Gates &amp; Evidence</span>
+              <span class="tab-badge hidden" id="tab-evidence-count"></span>
+            </button>
+            <button class="tab-btn" data-tab="preview" role="tab" aria-selected="false" type="button">
+              <span>Preview</span>
+              <span class="tab-badge hidden" id="tab-preview-count"></span>
+            </button>
+          </div>
+
+          <div class="inspector-body">
+            <div class="tab-panel active" id="panel-report"></div>
+            <div class="tab-panel" id="panel-diff"></div>
+            <div class="tab-panel" id="panel-evidence"></div>
+            <div class="tab-panel" id="panel-preview"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Slide-over SpecAgent Chat Drawer -->
+    <div class="drawer-backdrop hidden" id="agent-backdrop"></div>
+    <aside class="agent-drawer hidden" id="agent-drawer" aria-label="SpecAgent Chat Drawer">
+      <div class="drawer-header">
+        <div>
+          <h3>SpecAgent</h3>
+          <div class="drawer-sub">
+            <span class="status-dot dot-muted" id="drawer-ws-dot"></span>
+            <span id="drawer-ws-label">Disconnected</span>
+            <span class="sep">·</span>
+            <span class="mono-subtle" id="drawer-session-key"></span>
+          </div>
+        </div>
+        <div class="drawer-header-actions">
+          <button id="btn-agent-reconnect" class="btn btn-ghost btn-xs" type="button" title="Reconnect WebSocket">Reconnect</button>
+          <button id="btn-agent-close" class="icon-btn" type="button" aria-label="Close SpecAgent drawer">&times;</button>
+        </div>
+      </div>
+
+      <div class="drawer-messages" id="agent-messages">
+        <div class="empty-inline">Ask SpecAgent to explore a repository, explain a candidate, or schedule batches.</div>
+      </div>
+
+      <form class="drawer-composer" id="agent-form">
+        <textarea id="agent-input" class="input" rows="2" placeholder="Delegate a goal or ask about a candidate… (Enter to send, Shift+Enter for newline)"></textarea>
+        <div class="composer-bar">
+          <span class="composer-hint" id="agent-mode-hint">WS + HTTP fallback</span>
+          <div class="composer-btns">
+            <button id="btn-agent-stop" class="btn btn-danger-outline btn-xs hidden" type="button">Stop</button>
+            <button id="btn-agent-send" class="btn btn-primary btn-xs" type="submit">Send</button>
+          </div>
+        </div>
+      </form>
+    </aside>
+
+    <!-- Reusable Modal Host -->
+    <div class="modal-backdrop hidden" id="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-dialog" id="modal-dialog">
+        <div class="modal-header">
+          <h3 id="modal-title">Modal</h3>
+          <button id="modal-close" class="icon-btn" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-footer" id="modal-footer"></div>
+      </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-viewport" id="toast-viewport" aria-live="polite"></div>
+  </div>
+
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>

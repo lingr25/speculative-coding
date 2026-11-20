@@ -29,6 +29,9 @@ spec-worker = "speculative_coding.worker:main"
 [tool.setuptools.packages.find]
 include = ["speculative_coding*"]
 
+[tool.setuptools.package-data]
+speculative_coding = ["ui_static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --disable-warnings --tb=short"

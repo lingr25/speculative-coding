@@ -23,9 +23,9 @@
 - **静默哲学（Zero-Noise Silence）**：如果当前代码库没有高价值切入点，或者本轮候选路线全部未达到优秀标准，系统**什么也不生成、保持绝对安静**——不发垃圾通知，不堆积低质量分支。
 
 ### 2. 绝对权力红线：模型只有淘汰与提名权，人类独占合并权
-- 模型在全链路中仅有 **`DROP`（直接淘汰）**、**`REVISE`（给出具体意见打回重改）** 与 **`NOMINATE`（达标提名并生成报告预览）** 三种裁决权。
-- **物理剥夺危险能力**：模型侧永远拿不到 `merge`、`push`、`deploy`、凭据访问或 TTL 控制工具；候选代码禁止触碰受保护路径（`.git`、`.env*`、`.ssh`、`deploy`、`.github` 等），且**禁止修改或删除已有测试文件**（只允许新增测试），防止靠“改测试”蒙混过关。
-- 人类通过控制面执行的 `keep / steer / drop / export / merge` 全部幂等且绑定所有者；合并操作采用 **SHA-pinned CAS 本地合并**，永不自动向远端 `git push`。
+- 模型在全链路中仅有 **`DROP`（直接淘汰）**、**`REVISE`（给出具体意见打回重改）** 与 **`NOMINATE`（达标提名并生成报告预览）** 三种裁决权；同题赛马路线（`competition_group`）在达标后还会经过独立的 **Tournament Judge（锦标赛终审）** 自动优胜劣汰。
+- **物理剥夺危险能力**：模型侧永远拿不到 `merge`、`push`、`deploy`、凭据访问或 TTL 控制工具；候选代码禁止触碰受保护路径（`.git`、`.env*`、`.ssh`、`deploy`、`.github` 等），且默认**禁止修改或删除已有测试文件**（仅在项目显式开启 `allow_test_edits` 时放行，并强制运行基线测试回归校验且在审阅界面高亮标出）。
+- 人类通过控制面或内置 **Review Web UI** 执行的 `keep / steer / drop / export / merge` 全部幂等且绑定所有者；支持导出 `.patch` 与便携式 `.bundle`；合并操作采用 **SHA-pinned CAS 本地合并**，永不自动向远端 `git push`。
 
 ### 3. 零信任双节点物理分离（Control Plane + Sandbox Worker）
 - **控制面（Control Plane）**：只运行纯异步 LLM 推理编排、状态机与 SQLite 元数据（内存占用极低），集中保管全部 LLM API Key 与可选 GitHub App 凭据；**零本地编译、零重型依赖安装**，绝不因构建任务拖垮主业务或触发 OOM。
@@ -106,7 +106,8 @@ speculative_coding/
 ├── orchestrator.py    # SpeculativeOrchestrator 生命周期、审阅循环、TTL 与 HTTP API
 ├── agent.py           # SpecAgent 自然语言委派层（仓库解析、工程记忆、证据解释）
 ├── automation.py      # 持久化定时批跑与晨间审阅简报调度
-├── server.py          # 独立 aiohttp 控制面 HTTP / WebSocket 服务
+├── server.py          # 独立 aiohttp 控制面 HTTP / WebSocket 服务与静态 Review UI 托管
+├── ui_static/         # 零构建依赖的独立 Review Web UI（项目、审阅队列、Diff/报告/预览、SpecAgent 抽屉）
 └── cli.py             # 统一命令行入口（spec-coding / spec-server / spec-worker）
 ```
 
@@ -136,7 +137,7 @@ export SPEC_WORKER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(3
 
 也可零配置文件起步，`SpecConfig.from_env()` 自动读取 `SPEC_OPENAI_API_KEY`、`SPEC_OPENAI_BASE_URL`、`SPEC_MODEL`、`SPEC_DATA_DIR`、`SPEC_WORKER_TOKEN` 与 `SPEC_API_TOKEN`。
 
-### 3. 启动控制面服务
+### 3. 启动控制面服务与 Review Web UI
 
 ```bash
 spec-coding serve --config config.example.json --host 127.0.0.1 --port 8765
@@ -144,16 +145,25 @@ spec-coding serve --config config.example.json --host 127.0.0.1 --port 8765
 spec-server --config config.example.json --host 127.0.0.1 --port 8765
 ```
 
+启动后浏览器直接访问 `http://127.0.0.1:8765/`（或 `/ui`）即可打开内置的 **Speculative Coding Review Console**（零 Node.js 运行时依赖、完全离线可用、支持浅色/深色主题与 `Bearer` 令牌登录）：
+- 实时查看 Worker 在线状态、磁盘水位仪（`normal` / `high` / `blocked`）、活跃 Worktree 数与累计 Token 消耗；
+- 管理项目（创建、启停持续模式、一键触发 `Run Batch`、浏览 `Graveyard` 墓碑库）；
+- 3 分钟候选审阅工作流：安全 Markdown 人话报告、彩色 Unified Diff + 文件跳转、门禁与基线测试回归证据时间线、沙箱化预览产物，以及人工专属 `Keep / Steer / Drop / Export (.patch + .bundle) / CAS Merge` 操作；
+- 右侧内置 **SpecAgent** 委派对话抽屉（基于短时 `ws-ticket` WebSocket，并支持自动降级到 HTTP）。
+
+> **安全说明**：绑定非回环地址（如 `0.0.0.0`）时必须配置 `SPEC_API_TOKEN`（fail-closed）；仅在本地调试且确知风险时可通过 `--insecure-no-auth` 显式放行。
+
 核心 HTTP & WebSocket 接口：
+- `GET /` & `GET /ui`（内置独立 Review Web UI）
 - `GET /health`
 - `GET /api/spec-worker/ws`（Worker 反向 WSS 接入端点，校验 `Bearer $SPEC_WORKER_TOKEN`）
 - `GET /api/spec/status`
 - `GET / POST /api/spec/projects` & `PATCH /api/spec/projects/{project_id}`
-- `POST /api/spec/projects/{project_id}/run`
-- `GET /api/spec/candidates` & `GET /api/spec/candidates/{cand_id}`
+- `POST /api/spec/projects/{project_id}/run` & `GET /api/spec/projects/{project_id}/graveyard`
+- `GET /api/spec/candidates` & `GET /api/spec/candidates/{cand_id}` & `GET /api/spec/candidates/{cand_id}/events`
 - `GET /api/spec/candidates/{cand_id}/preview/{path}`（严格沙箱 CSP 预览）
 - `POST /api/spec/candidates/{cand_id}/{keep|steer|drop|export|merge}`
-- `POST /api/spec/agent/turn` & `GET /api/spec/agent/ws`（对话式委派 Agent）
+- `POST /api/spec/agent/turn`、`POST /api/spec/agent/ws-ticket` & `GET /api/spec/agent/ws`（对话式委派 Agent）
 
 ### 4. 启动独立沙箱 Worker
 
@@ -173,6 +183,7 @@ spec-worker --root /opt/spec_sandbox --server wss://control-plane.example.com/ap
 spec-coding status --data-dir ./data
 spec-coding candidates --data-dir ./data
 spec-coding export <cand_id> --data-dir ./data
+spec-coding export <cand_id> --data-dir ./data --bundle ./candidate.bundle
 
 # 开发/测试环境下运行本地单轮投机批次（需显式开启 --allow-local-sandbox）
 spec-coding run --repo /path/to/repo --branch main --gate "python -m pytest" --allow-local-sandbox
