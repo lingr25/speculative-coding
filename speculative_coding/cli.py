@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 from pathlib import Path
@@ -27,7 +28,15 @@ def _load_config(args: argparse.Namespace) -> SpecConfig:
 
 def _cmd_serve(args: argparse.Namespace) -> None:
     config = _load_config(args)
-    plane = create_control_plane(config)
+    try:
+        plane = create_control_plane(
+            config,
+            host=args.host,
+            allow_insecure_no_auth=bool(getattr(args, "insecure_no_auth", False)),
+            allow_owner_header=bool(getattr(args, "allow_owner_header", False)),
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     web.run_app(plane.app, host=args.host, port=args.port)
 
 
@@ -95,16 +104,47 @@ def _cmd_export(args: argparse.Namespace) -> None:
     cand = store.get("candidates", args.cand_id)
     if not cand:
         raise SystemExit(f"Candidate not found: {args.cand_id}")
-    if args.sandbox_root:
-        backend = LocalDirSandbox(Path(args.sandbox_root), unsafe_test_mode=True, min_free_gb=0)
+    bundle_out = str(getattr(args, "bundle", "") or "").strip()
+    sandbox_root = str(getattr(args, "sandbox_root", "") or "").strip()
+    if bundle_out and not sandbox_root:
+        default_local = config.data_dir / "local_sandbox"
+        if default_local.is_dir():
+            sandbox_root = str(default_local)
+        else:
+            raise SystemExit("Exporting a git bundle requires --sandbox-root pointing to the sandbox git pool.")
+    if sandbox_root:
+        backend = LocalDirSandbox(Path(sandbox_root), unsafe_test_mode=True, min_free_gb=0)
         exported = asyncio.run(
             backend.call(
                 "export",
                 project_id=cand["project_id"],
                 cand_id=cand["cand_id"],
                 base_sha=cand["base_sha"],
+                include_bundle=bool(bundle_out),
             )
         )
+        if bundle_out:
+            encoded = str(exported.get("bundle_base64") or "")
+            if not encoded:
+                raise SystemExit(str(exported.get("bundle_error") or "Sandbox backend did not return a git bundle"))
+            out_path = Path(bundle_out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(base64.b64decode(encoded, validate=True))
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "bundle": str(out_path),
+                        "head_sha": exported.get("head_sha", ""),
+                        "base_sha": exported.get("base_sha", ""),
+                        "branch_ref": exported.get("branch_ref", ""),
+                        "apply_instructions": exported.get("apply_instructions", {}),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return
         print(exported["patch"])
     else:
         print(cand["diff_text"])
@@ -165,6 +205,16 @@ def main(argv: list[str] | None = None) -> None:
     p_serve.add_argument("--data-dir", default="", help="Data directory")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
+    p_serve.add_argument(
+        "--insecure-no-auth",
+        action="store_true",
+        help="Explicitly allow binding to a non-loopback host without api_token (UNSAFE)",
+    )
+    p_serve.add_argument(
+        "--allow-owner-header",
+        action="store_true",
+        help="Trust client X-Spec-Owner header with BearerTokenAuthProvider (ONLY behind a trusted reverse proxy)",
+    )
     p_serve.set_defaults(func=_cmd_serve)
 
     p_worker = sub.add_parser("worker", help="Run the reverse-WSS sandbox worker daemon")
@@ -183,11 +233,12 @@ def main(argv: list[str] | None = None) -> None:
     p_cands.add_argument("--limit", type=int, default=20)
     p_cands.set_defaults(func=_cmd_candidates)
 
-    p_export = sub.add_parser("export", help="Print patch diff for a candidate")
+    p_export = sub.add_parser("export", help="Print patch diff or write a git bundle for a candidate")
     p_export.add_argument("cand_id")
     p_export.add_argument("--config", default="")
     p_export.add_argument("--data-dir", default="")
     p_export.add_argument("--sandbox-root", default="", help="Optional local sandbox root to export directly from git refs")
+    p_export.add_argument("--bundle", default="", help="Write a portable git bundle file to this path")
     p_export.set_defaults(func=_cmd_export)
 
     p_run = sub.add_parser("run", help="Run one local speculative batch (development/testing)")

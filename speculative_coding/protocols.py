@@ -39,10 +39,18 @@ class SingleOwnerAuthProvider:
 class BearerTokenAuthProvider:
     """Constant-time Bearer token auth provider for standalone production HTTP servers."""
 
-    def __init__(self, token: str, *, owner_id: str = "admin", display_name: str = "admin") -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        owner_id: str = "admin",
+        display_name: str = "admin",
+        allow_owner_header: bool = False,
+    ) -> None:
         self.token = token.strip()
         self.owner_id = str(owner_id)
         self.display_name = str(display_name)
+        self.allow_owner_header = bool(allow_owner_header)
 
     def require_admin(self, request: web.Request) -> dict[str, Any]:
         if len(self.token) < 16:
@@ -50,7 +58,10 @@ class BearerTokenAuthProvider:
         header = request.headers.get("Authorization", "")
         if not hmac.compare_digest(header, "Bearer " + self.token):
             raise web.HTTPUnauthorized(text="invalid bearer token")
-        owner = request.headers.get("X-Spec-Owner", "").strip() or self.owner_id
+        if self.allow_owner_header:
+            owner = request.headers.get("X-Spec-Owner", "").strip() or self.owner_id
+        else:
+            owner = self.owner_id
         return {
             "owner_id": owner,
             "name": self.display_name,
